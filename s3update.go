@@ -1,39 +1,31 @@
 package s3update
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mitchellh/ioprogress"
+	"golang.org/x/mod/semver"
 )
 
+// Updater holds configuration values provided by the program to be updated
 type Updater struct {
-	// CurrentVersion represents the current binary version.
-	// This is generally set at the compilation time with -ldflags "-X main.Version=42"
-	// See the README for additional information
 	CurrentVersion string
-	// S3Bucket represents the S3 bucket containing the different files used by s3update.
-	S3Bucket string
-	// S3Region represents the S3 region you want to work in.
-	S3Region string
-	// S3ReleaseKey represents the raw key on S3 to download new versions.
-	// The value can be something like `cli/releases/cli-{{OS}}-{{ARCH}}`
-	S3ReleaseKey string
-	// S3VersionKey represents the key on S3 to download the current version
-	S3VersionKey string
-	// AWSCredentials represents the config to use to connect to s3
-	AWSCredentials *credentials.Credentials
+	S3VersionKey   string
+	ChecksumKey    string
+	S3Bucket       string
+	S3ReleaseKey   string
+	Verbose        bool
 }
 
 // validate ensures every required fields is correctly set. Otherwise and error is returned.
@@ -41,23 +33,15 @@ func (u Updater) validate() error {
 	if u.CurrentVersion == "" {
 		return fmt.Errorf("no version set")
 	}
-
 	if u.S3Bucket == "" {
 		return fmt.Errorf("no bucket set")
 	}
-
-	if u.S3Region == "" {
-		return fmt.Errorf("no s3 region")
-	}
-
 	if u.S3ReleaseKey == "" {
 		return fmt.Errorf("no s3ReleaseKey set")
 	}
-
 	if u.S3VersionKey == "" {
 		return fmt.Errorf("no s3VersionKey set")
 	}
-
 	return nil
 }
 
@@ -78,100 +62,137 @@ func AutoUpdate(u Updater) error {
 	return runAutoUpdate(u)
 }
 
-// generateS3ReleaseKey dynamically builds the S3 key depending on the os and architecture.
-func generateS3ReleaseKey(path string) string {
-	path = strings.Replace(path, "{{OS}}", runtime.GOOS, -1)
-	path = strings.Replace(path, "{{ARCH}}", runtime.GOARCH, -1)
-
-	return path
+// generateURL composes the download or checksum URL depending on version, os and architecture
+func generateURL(bucket, pathTemplate, version string) string {
+	p := strings.Replace(pathTemplate, "{{VERSION}}", version, -1)
+	p = strings.Replace(p, "{{ARCH}}", runtime.GOARCH, -1)
+	p = strings.Replace(p, "{{OS}}", runtime.GOOS, -1)
+	return "https://" + bucket + ".s3.amazonaws.com/" + p
 }
 
-func runAutoUpdate(u Updater) error {
-	localVersion, err := strconv.ParseInt(u.CurrentVersion, 10, 64)
-	if err != nil || localVersion == 0 {
-		return fmt.Errorf("invalid local version")
+func fetchRemoteVersion(bucket string) (string, error) {
+	resp, err := http.Get("https://" + bucket + ".s3.amazonaws.com/VERSION")
+	if err != nil {
+		return "", err
 	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	remoteVersion := strings.TrimSpace(string(body))
+	if semver.IsValid(remoteVersion) == false {
+		return "", fmt.Errorf("remote version is invalid: %v", remoteVersion)
+	}
+	return remoteVersion, nil
+}
 
-	svc := s3.New(session.New(), &aws.Config{
-		Region:      aws.String(u.S3Region),
-		Credentials: u.AWSCredentials,
-	})
-
-	resp, err := svc.GetObject(&s3.GetObjectInput{Bucket: aws.String(u.S3Bucket), Key: aws.String(u.S3VersionKey)})
+func downloadUpdate(downloadURL, checksumURL, version string) error {
+	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	b, err := ioutil.ReadAll(resp.Body)
+	checksumResp, err := http.Get(checksumURL)
+	if err != nil {
+		return err
+	}
+	defer checksumResp.Body.Close()
+	checksumRespBody, err := ioutil.ReadAll(checksumResp.Body)
 	if err != nil {
 		return err
 	}
 
-	remoteVersion, err := strconv.ParseInt(string(b), 10, 64)
-	if err != nil || remoteVersion == 0 {
-		return fmt.Errorf("invalid remote version")
+	progressR := &ioprogress.Reader{
+		Reader:       resp.Body,
+		Size:         resp.ContentLength,
+		DrawInterval: 500 * time.Millisecond,
+		DrawFunc: ioprogress.DrawTerminalf(os.Stdout, func(progress, total int64) string {
+			bar := ioprogress.DrawTextFormatBar(40)
+			return fmt.Sprintf("%s %20s", bar(progress, total), ioprogress.DrawTextFormatBytes(progress, total))
+		}),
 	}
 
-	fmt.Printf("s3update: Local Version %d - Remote Version: %d\n", localVersion, remoteVersion)
-	if localVersion < remoteVersion {
-		fmt.Printf("s3update: version outdated ... \n")
-		s3Key := generateS3ReleaseKey(u.S3ReleaseKey)
-		resp, err := svc.GetObject(&s3.GetObjectInput{Bucket: aws.String(u.S3Bucket), Key: aws.String(s3Key)})
+	// follow symlinks
+	currentExecutable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	target, err := filepath.EvalSymlinks(currentExecutable)
+	if err != nil {
+		return err
+	}
+
+	// verify target exists, move to backup
+	_, err = os.Stat(target)
+	if err != nil {
+		return nil
+	}
+	backup := target + ".bak"
+	os.Rename(target, backup)
+
+	// use the same flags that ioutil.WriteFile uses
+	f, err := os.OpenFile(target, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		os.Rename(backup, target)
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, progressR); err != nil {
+		os.Rename(backup, target)
+		return err
+	}
+	f.Close()
+
+	f, err = os.Open(target)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		os.Rename(backup, target)
+		return err
+	}
+	if string(checksumRespBody) != hex.EncodeToString(h.Sum(nil)) {
+		os.Rename(backup, target)
+		return fmt.Errorf("%s checksum mismatch", version)
+	}
+	os.Remove(backup)
+
+	fmt.Printf("binocs successfully updated to %s\n", version)
+
+	return nil
+	// re-run original command
+	return syscall.Exec(target, os.Args, os.Environ())
+}
+
+func runAutoUpdate(u Updater) error {
+	if !semver.IsValid(u.CurrentVersion) {
+		return fmt.Errorf("invalid local version")
+	}
+	localVersion := u.CurrentVersion
+	remoteVersion, err := fetchRemoteVersion(u.S3Bucket)
+	if err != nil {
+		return err
+	}
+	if semver.Compare(localVersion, remoteVersion) == -1 {
+		fmt.Printf("upgrading from %s to %s\n", localVersion, remoteVersion)
+		downloadURL := generateURL(u.S3Bucket, u.S3ReleaseKey, remoteVersion)
+		checksumURL := generateURL(u.S3Bucket, u.ChecksumKey, remoteVersion)
+		if u.Verbose {
+			fmt.Printf("downloadURL: %s\n", downloadURL)
+			fmt.Printf("checksumURL: %s\n", checksumURL)
+		}
+		err = downloadUpdate(downloadURL, checksumURL, remoteVersion)
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
-		progressR := &ioprogress.Reader{
-			Reader:       resp.Body,
-			Size:         *resp.ContentLength,
-			DrawInterval: 500 * time.Millisecond,
-			DrawFunc: ioprogress.DrawTerminalf(os.Stdout, func(progress, total int64) string {
-				bar := ioprogress.DrawTextFormatBar(40)
-				return fmt.Sprintf("%s %20s", bar(progress, total), ioprogress.DrawTextFormatBytes(progress, total))
-			}),
-		}
-
-		dest, err := os.Executable()
-		if err != nil {
-			return err
-		}
-
-		// Move the old version to a backup path that we can recover from
-		// in case the upgrade fails
-		destBackup := dest + ".bak"
-		if _, err := os.Stat(dest); err == nil {
-			os.Rename(dest, destBackup)
-		}
-
-		// Use the same flags that ioutil.WriteFile uses
-		f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
-		if err != nil {
-			os.Rename(destBackup, dest)
-			return err
-		}
-		defer f.Close()
-
-		fmt.Printf("s3update: downloading new version to %s\n", dest)
-		if _, err := io.Copy(f, progressR); err != nil {
-			os.Rename(destBackup, dest)
-			return err
-		}
-		// The file must be closed already so we can execute it in the next step
-		f.Close()
-
-		// Removing backup
-		os.Remove(destBackup)
-
-		fmt.Printf("s3update: updated with success to version %d\nRestarting application\n", remoteVersion)
-
-		// The update completed, we can now restart the application without requiring any user action.
-		if err := syscall.Exec(dest, os.Args, os.Environ()); err != nil {
-			return err
-		}
-
 		os.Exit(0)
 	}
-
+	if u.Verbose {
+		fmt.Printf("updater: using the latest version: %s\n", u.CurrentVersion)
+	}
 	return nil
 }

@@ -22,32 +22,13 @@ mybucket/
 
 ## Usage
 
-Updates are easier to deal with when done through a continuous integration platform. We're using CircleCI but the following
-excerpt can easily be adapted to whichever solution being used.
-
-### CircleCI
-
-[xgo](https://github.com/karalabe/xgo) is being used to easily cross-compile code.
-
-Adding the following at the end of the build script will push the binaries and its version to S3.
-
-```sh
-xgo --targets="linux/amd64,darwin/amd64" -ldflags="-X main.Version=$CIRCLE_BUILD_NUM" .
-
-if [[ "$CIRCLE_BRANCH" = "master" ]]; then
-	aws s3 cp mytool-darwin-10.6-amd64 s3://mybucket/mytool/mytool-darwin-amd64 --acl authenticated-read
-	aws s3 cp mytool-linux-amd64 s3://mybucket/mytool/mytool-linux-amd64 --acl authenticated-read
-	echo -n $CIRCLE_BUILD_NUM > VERSION && aws s3 cp VERSION  s3://mybucket/mytool/VERSION --acl authenticated-read
-fi
-```
-
 ### Example
 
 ```go
 package main
 
 import (
-	"github.com/heetch/s3update"
+	"github.com/automato-io/s3update"
 )
 
 var (
@@ -71,19 +52,6 @@ func main() {
   ...
 }
 ```
-
-Binary must be compiled with a flag specifying the new version:
-
-```sh
-go build -ldflags "-X main.Version=111" main.go
-```
-
-## Contributions
-
-Any contribution is welcomed!
-
-- Open an issue if you want to discuss bugs/features
-- Open Pull Requests if you want to contribute to the code
 
 ## Copyright
 
