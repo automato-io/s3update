@@ -206,7 +206,7 @@ func downloadUpdate(downloadURL, checksumURL, version string) error {
 
 	os.Remove(backup)
 
-	fmt.Printf("binocs successfully updated to %s\n", version)
+	fmt.Printf("successfully updated to %s\n", version)
 
 	return nil
 	// re-run original command
