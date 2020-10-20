@@ -207,7 +207,6 @@ func downloadUpdate(downloadURL, checksumURL, version string) error {
 
 	fmt.Printf("successfully updated to %s\n", version)
 
-	return nil
 	// re-run original command
 	return syscall.Exec(target, os.Args, os.Environ())
 }
