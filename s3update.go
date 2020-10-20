@@ -1,6 +1,8 @@
 package s3update
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -87,6 +89,40 @@ func fetchRemoteVersion(bucket string) (string, error) {
 	return remoteVersion, nil
 }
 
+func untgzFile(filename string) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	r, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(r)
+	header, err := tr.Next()
+	if err != nil {
+		return err
+	}
+	if header.Typeflag != tar.TypeReg {
+		return fmt.Errorf("gunzipping file: unknown file type")
+	}
+	data := make([]byte, header.Size)
+	_, err = tr.Read(data)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	os.Remove(filename)
+	w, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	_, err = w.Write(data)
+	return err
+}
+
 func downloadUpdate(downloadURL, checksumURL, version string) error {
 	resp, err := http.Get(downloadURL)
 	if err != nil {
@@ -159,6 +195,15 @@ func downloadUpdate(downloadURL, checksumURL, version string) error {
 		os.Rename(backup, target)
 		return fmt.Errorf("%s checksum mismatch", version)
 	}
+
+	if strings.HasSuffix(downloadURL, ".tgz") {
+		err = untgzFile(target)
+		if err != nil {
+			os.Rename(backup, target)
+			return err
+		}
+	}
+
 	os.Remove(backup)
 
 	fmt.Printf("binocs successfully updated to %s\n", version)
