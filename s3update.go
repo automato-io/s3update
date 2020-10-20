@@ -203,6 +203,12 @@ func downloadUpdate(downloadURL, checksumURL, version string) error {
 		}
 	}
 
+	err = os.Chmod(target, 0755)
+	if err != nil {
+		os.Rename(backup, target)
+		return err
+	}
+
 	os.Remove(backup)
 
 	fmt.Printf("successfully updated to %s\n", version)
