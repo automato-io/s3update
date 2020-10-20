@@ -107,8 +107,7 @@ func untgzFile(filename string) error {
 	if header.Typeflag != tar.TypeReg {
 		return fmt.Errorf("gunzipping file: unknown file type")
 	}
-	data := make([]byte, header.Size)
-	_, err = tr.Read(data)
+	data, err := ioutil.ReadAll(tr)
 	if err != nil {
 		return err
 	}
